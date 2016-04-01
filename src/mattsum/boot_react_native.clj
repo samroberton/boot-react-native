@@ -2,7 +2,8 @@
   {:boot/export-tasks true}
   (:require [boot
              [core :as c :refer [deftask with-pre-wrap]]
-             [util :as util]]
+             [util :as util]
+             [file :as bf]]
             [boot.from.backtick :refer [template]]
             [clojure.java.io :as io]
             [me.raynes.conch :refer [programs with-programs let-programs] :as sh]
@@ -62,16 +63,17 @@
     (with-pre-wrap fileset
       (let [out-dir (str (or output-dir "main.out") "/")
             tmp (c/tmp-dir!)
-            main-file (->> "main.js"
+            main-file (->> (str out-dir "cljs_deps.js")
                            (find-file fileset))
             boot-main (->> main-file
                            slurp
-                           (re-find #"(boot.cljs.\w+)\""))
+                           (re-find #"'(boot.cljs.\w+)'"))
             boot-main (get boot-main 1)
-            out-file (io/file tmp "main.js")
+            out-file (doto (io/file tmp out-dir "main.js")
+                       (io/make-parents))
             new-script (str "
 var CLOSURE_UNCOMPILED_DEFINES = null;
-require('./" out-dir "goog/base.js');
+require('./goog/base.js');
 require('" boot-main "');
 ")]
         (spit out-file new-script)
@@ -120,7 +122,7 @@ require('" boot-main "');
 
 
 (deftask shim-boot-reload
-  []
+  [i id ID str "The CLJS build ID"]
   (let [ns 'mattsum.boot-react-native.shim-boot-reload
         temp (template
               ((ns ~ns
@@ -134,14 +136,14 @@ require('" boot-main "');
                  (aset js/adzerk.boot_reload.reload "reload_img" no-op))))]
     (c/with-pre-wrap fileset
       (bh/add-cljs-template-to-fileset fileset
-                                       nil
+                                       (when id #{id})
                                        ns
                                        temp))))
 
 (deftask shim-repl-print
   "Weasel's repl-print function does not work in React Native
    TODO: Add PR for changing this function in Weasel code"
-  []
+  [i id ID str "The CLJS build ID"]
   (let [ns 'mattsum.boot-react-native.shim-repl-print
         temp (template
               ((ns ~ns
@@ -156,7 +158,7 @@ require('" boot-main "');
                ))]
     (c/with-pre-wrap fileset
       (bh/add-cljs-template-to-fileset fileset
-                                       nil
+                                       (when id #{id})
                                        ns
                                        temp))))
 
@@ -166,12 +168,11 @@ require('" boot-main "');
    s server-url SERVE str "The (optional) IP address and port for the websocket server to listen on."]
 
   (comp (shim-goog-req :output-dir output-dir)
-     (shim-goog-reloading :output-dir output-dir
-                          :asset-path asset-path
-                          :server-url server-url)
-     (link-goog-deps)
-     (replace-main)
-     ))
+        (shim-goog-reloading :output-dir output-dir
+                             :asset-path asset-path
+                             :server-url server-url)
+        (link-goog-deps :cljs-dir output-dir)
+        (replace-main :output-dir output-dir)))
 
 (deftask print-android-log
   "Prints React Native log messages (from adb logcat)"
@@ -194,38 +195,74 @@ require('" boot-main "');
 
 (deftask start-rn-packager
   "Starts the React Native packager. Includes a custom transformer that skips transformation for ClojureScript generated files."
-  [a app-dir OUT str  "The (relative) path to the React Native application"
-   t target-path TAR str "The (relative) path to the build directory (e.g. app/build)"]
+  [a app-dir APP str "The (relative) path to the React Native application"
+   o output-dir OUT str "The cljs :output-dir"]
   (let [app-dir (or app-dir "app")
-        build-dir (or target-path (str app-dir "/build"))
-        transformer-rel-path "transformer/cljs-rn-transformer.js"
-        transformer-path (bh/write-resource-to-path
-                          "mattsum/boot_rn/js/cljs-rn-transformer.js"
-                          transformer-rel-path)
-        command (str app-dir "/node_modules/react-native/packager/packager.sh --transformer " build-dir "/" transformer-rel-path)
+        tmp (c/tmp-dir!)
+
+        transformer-out-file (io/file tmp "cljs-rn-transformer.js")
+        transformer-content (slurp (io/resource "mattsum/boot_rn/js/cljs-rn-transformer.js"))
+        command (str (.getAbsolutePath tmp)
+                     "/node_modules/react-native/packager/packager.sh"
+                     " --transformer " (.getAbsolutePath transformer-out-file))
+
+        previous-files (atom nil)
         process (atom nil)]
-    (comp
-     (c/with-pre-wrap fileset
-       (-> fileset
-           (c/add-resource transformer-path)
-           (c/commit!))
-       )
-     (c/with-post-wrap fileset
-       (util/info "Starting React Packager - %s\n" command)
-       (let [start-process #(reset! process (shell command))]
-         (when (nil? @process)
-           (start-process))
-         (let [exit (exit-code @process)]
-           (when (realized? exit) ;;restart server if necessary
-             (if (= 0 @exit)
-               (util/warn "Process exited normally, restarting.\n")
-               (util/fail "Process crashed, restarting.\n"))
-             (start-process))))
-       fileset))))
+    ;; Write out the custom transformer -- this happens outside the
+    ;; pre/post-wrap since there's nothing in the fileset that could cause it to
+    ;; change.
+    (util/info "Writing %s.\n" (.getAbsolutePath transformer-out-file))
+    (spit transformer-out-file transformer-content)
+
+    ;; Copy genuine node_modules outside the pre/post-wrap so that we only do it
+    ;; once, on the assumption that they won't change. (Even if they do change,
+    ;; they're not in the fileset -- there's too many of them for that -- so we
+    ;; wouldn't reliably see the changes anyway.)
+    (let [modules-dir (io/file (str app-dir "/node_modules"))
+          modules-path (.toPath modules-dir)]
+      (util/info "Copying modules in %s to %s.\n" modules-path (str (.getAbsolutePath tmp) "/node_modules"))
+      (doseq [in-file (bf/file-seq modules-dir)]
+        (when-not (.isDirectory in-file)
+          (let [out-file (io/file tmp (str "node_modules/" (.relativize modules-path (.toPath in-file))))]
+            (io/make-parents out-file)
+            (bf/hard-link in-file out-file)))))
+
+    (c/with-post-wrap fileset
+      (let [fileset-diff (c/fileset-diff @previous-files fileset :hash)]
+        (reset! previous-files fileset)
+
+        (when-let [files (not-empty (c/by-re [#"node_modules/.*"] (c/output-files fileset-diff)))]
+          (util/info "Copying compiled ClojureScript code to node_modules/.*\n")
+          (doseq [in files]
+            (let [in-file  (c/tmp-file in)
+                  path     (c/tmp-path in)
+                  out-file (io/file tmp path)]
+              (io/make-parents out-file)
+              (bf/hard-link in-file out-file))))
+
+        (doseq [relpath ["main.js" "goog/base.js"]]
+          (when-let [in (first (c/by-path [(str output-dir "/" relpath)]
+                                          (c/output-files fileset-diff)))]
+            (let [in-file  (c/tmp-file in)
+                  out-file (io/file tmp relpath)]
+              (util/info "Copying %s to %s.\n" relpath (.getAbsolutePath out-file))
+              (io/make-parents out-file)
+              (bf/hard-link in-file out-file))))
+
+        (let [start-process #(reset! process (shell command))]
+          (when (nil? @process)
+            (util/info "Starting React Packager - %s\n" command)
+            (start-process))
+          (let [exit (exit-code @process)]
+            (when (realized? exit) ;;restart server if necessary
+              (if (= 0 @exit)
+                (util/warn "Process exited normally, restarting.\n")
+                (util/fail "Process crashed, restarting.\n"))
+              (start-process))))))))
 
 (deftask shim-browser-repl-bootstrap
   "Prevents bootstrap from running twice and causing goog.require to loop indefinitely"
-  []
+  [i id ID str "The CLJS build ID"]
   (let [ns 'mattsum.boot-react-native.shim-browser-repl-bootstrap
         temp (template
               ((ns ~ns
@@ -240,16 +277,15 @@ require('" boot-main "');
                ))]
     (c/with-pre-wrap fileset
       (bh/add-cljs-template-to-fileset fileset
-                                       nil
+                                       (when id #{id})
                                        ns
                                        temp))))
 
 (deftask before-cljsbuild
-  []
-  (comp (shim-browser-repl-bootstrap)
-     (shim-boot-reload)
-     (shim-repl-print)
-     ))
+  [i id ID str "The CLJS build ID"]
+  (comp (shim-browser-repl-bootstrap :id id)
+        (shim-boot-reload :id id)
+        (shim-repl-print :id id)))
 
 (deftask after-cljsbuild
   [o output-dir OUT str  "The cljs :output-dir"
@@ -259,16 +295,17 @@ require('" boot-main "');
   (comp (react-native-devenv :output-dir output-dir
                              :asset-path asset-path
                              :server-url server-url)
-        (start-rn-packager :app-dir app-dir)))
+        (start-rn-packager :app-dir app-dir
+                           :output-dir output-dir)))
 
 (deftask run-in-simulator
   "Run the app in the simulator"
-  []
+  [A app-dir OUT str  "The (relative) path to the React Native application"]
   (let [running (atom false)]
     (c/with-post-wrap fileset
       (when-not @running ;; make sure we run only once
         (reset! running true)
-        (binding [util/*sh-dir* "app"]
+        (binding [util/*sh-dir* (or app-dir "app")]
           (util/dosh "node" "node_modules/react-native/local-cli/cli.js" "run-ios")))
       fileset)))
 

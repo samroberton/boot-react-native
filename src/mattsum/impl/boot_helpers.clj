@@ -12,7 +12,6 @@
 
 (defn read-resource-
   [src]
-  (println "Reading resource - " src)
   (->> src io/resource slurp))
 
 ;; For some reason Clojure/boot doesn't like us reading from the jar file too often,
@@ -40,7 +39,6 @@
   the new fileset"
   ([fileset path modify-fn] (modify-file fileset path modify-fn {}))
   ([fileset path modify-fn replacements]
-   (println "Modifying " path " using " modify-fn)
    (let [tmp (c/tmp-dir!)
          out-file (make-absolute tmp path)]
      (let [base-file (->> path
@@ -143,7 +141,6 @@
 (defn add-cljs-require-to-edn-files
   [fileset ids ns]
   (let [tmp (c/tmp-dir!)]
-    (println "Found edn files - " (get-cljs-edn-files fileset ids))
     (doseq [edn-file (get-cljs-edn-files fileset ids)]
       (let [path (c/tmp-path edn-file)
             edn-file (c/tmp-file edn-file)
